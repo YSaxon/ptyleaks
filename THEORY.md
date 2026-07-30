@@ -61,13 +61,63 @@ leaked. Any output → live, regardless of controlling-terminal status.
 
 ## Known false positives (can't be fully resolved externally)
 
-1. **Just-opened pty, shell not exec'd yet** — reads as leaked for a brief
-   window. Mitigate by only classifying, or by freezing the process
-   (`kill -STOP`) before sampling so the window is zero.
+1. **Just-opened pty, shell not exec'd yet** — reads as leaked for a
+   millisecond-scale window right after `openpty()`, before the child has
+   attached to the slave. See "confirm-before-close" below for how this is
+   handled — a `kill -STOP` bracket was tried first and rejected; it broke
+   the close mechanism itself (see below).
 2. **Child exited, output still buffered** — master legitimately still
    needed to drain remaining bytes.
 3. No supported way to inspect another process's kqueue registrations, so
    "does libuv still know about this fd" can't be checked directly.
+
+Once a master's slave has been opened and then fully closed (child ran and
+exited), it does **not** spontaneously become live again in normal
+operation — nothing reopens that specific `/dev/ttysNNN` path afterward.
+So the false-positive window is bounded to milliseconds around creation,
+not an ongoing risk for anything that's been sitting leaked for more than
+a second or two.
+
+## Why a single fresh rescan isn't enough, and confirm-before-close is
+
+A lone snapshot — even one taken right before closing, with no reference to
+an earlier checkpoint — carries zero information about a fd's age. A pty
+opened one millisecond before that scan and one opened an hour before it
+look identical to it. Age only becomes evidence when you have two
+checkpoints, separated by real elapsed time, and confirm the state
+persisted between them.
+
+So `--close` runs two scans: the initial classify scan, then — after a real
+delay (`--confirm-delay`, default 2s) — a second scan restricted to exactly
+the candidates the first scan called leaked. Only the intersection (leaked
+in both) gets closed. If something flipped to live in the interim, that's
+exactly the in-flight-setup case the delay exists to catch, and it's
+excluded. This replaced an earlier `--keep-newest N` design (hold back the
+newest N fds by fd-number position) that was a strictly worse proxy: fd
+numbers get reused as old fds close, so "highest number" and "most
+recently opened" can diverge, and a fixed count is wrong in both
+directions — too loose for a slow leaker, too tight for a process that
+opens a burst all at once.
+
+## `kill -STOP` before `lldb attach` breaks attach — do not do this
+
+An earlier version bracketed the `lldb attach` with an external
+`kill -STOP` / `kill -CONT`, on the theory that freezing the process first
+would close the fd-number-reuse race (see below) down to zero. This was
+wrong and dangerous: reproduced directly, `kill -STOP` before attach made
+`lldb` either hang for **exactly 30 seconds** before failing with
+`"attach failed: attached to process, but could not pause execution"`, or
+occasionally appear to attach fine — but in both cases the target process
+did not survive. `lldb`'s own `process attach` already suspends the target
+for the whole scripted session (that's why `expr` calls run synchronously
+against it) — pre-stopping it externally conflicts with lldb's own
+suspend/resume bookkeeping badly enough to kill the target. The fix: never
+send an external `STOP`/`CONT` around an lldb attach. Let lldb do its own
+pausing.
+
+This also explains an earlier, unexplained "why does this take 30 seconds
+when the scan itself is under 1 second" mystery from testing — it was
+always this bug, not scan speed.
 
 ## Optional stronger signal: `tcgetpgrp`
 
@@ -77,12 +127,31 @@ positive pgid; a master with no session returns -1. Useful as a second
 opinion, not proof — validate against a known-good pty first
 (`python3 -c 'import pty,os,time; m,s=pty.openpty(); print(os.ttyname(s)); time.sleep(300)'`)
 since the minor-number and ioctl semantics are OS-version implementation
-details, not documented API.
+details, not documented API. Not currently used by the tool.
+
+## `set -e` traps when scripting subprocess control
+
+Two real bugs, both the same shape, found by running against live
+processes rather than synthetic tests:
+
+- A bare `var=$(cmd)` or bare `cmd` whose exit status is nonzero kills the
+  whole script under `set -e` — even mid-loop, even if the caller meant to
+  handle the failure. `close_fds` returning 1 on an attach failure, called
+  as `if ...; then close_fds ...; fi`, silently aborted every pid after the
+  first unattachable one, with no visible error. Fix: functions invoked as
+  bare statements inside a `set -e` script must never return nonzero;
+  report failure via stderr + counters instead of exit status.
+- `${#ASSOC_ARRAY[@]}` and `${!ASSOC_ARRAY[@]}` throw "unbound variable"
+  under `set -u` when `ASSOC_ARRAY` is a **declared-but-empty** associative
+  array, at least on bash 5.3 on this machine (reproduced directly:
+  `bash -c 'set -u; declare -A A; echo ${#A[@]}'` fails). Indexed arrays
+  (`declare -a`) don't have this bug. Fix: track membership/emptiness with
+  a plain indexed array alongside the associative one, never test the
+  associative array's own size directly.
 
 ## Policy this tool implements
 
-Classify only, by default. Never close anything automatically. Exclude the
-newest N fds per process from any "leaked" recommendation, since a fd
-opened microseconds ago is indistinguishable from a real leak by this
-method and the downside of guessing wrong (killing an in-flight tool call)
-is worse than leaving a few fds unreclaimed.
+Classify by default, never closing anything. `--close` requires the
+two-scan confirmation above (see "confirm-before-close") before touching
+anything, and even then never touches anything classified live at either
+scan.
