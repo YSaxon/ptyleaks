@@ -209,7 +209,7 @@ classify_pid() {
       f*) fd="${line#f}" ;;
       r*) dev=$(( 16#${line#r0x} & 0xffffff )) ;;
       n/dev/ptmx)
-        ttyname="ttys${dev}"
+        ttyname=$(printf 'ttys%03d' "$dev")  # macOS pads to 3 digits: ttys004, not ttys4
         fds+=("$fd"); ttys+=("$ttyname")
         ;;
     esac
@@ -283,7 +283,7 @@ confirm_and_close() {
         continue
       fi
       dev=$(( 16#$row & 0xffffff ))
-      ttyname="ttys${dev}"
+      ttyname=$(printf 'ttys%03d' "$dev")  # macOS pads to 3 digits: ttys004, not ttys4
       if is_live "$ttyname"; then
         excluded+=("$fd")
       else
