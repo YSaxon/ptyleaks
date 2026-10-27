@@ -8,8 +8,7 @@ Code written mostly by Claude. I can't guarantee there aren't mistakes but in my
 
 [^1]: **Gemini CLI** and **Claude Code** (and potentially other node-based CLIs or agents, though they haven't been tested).
 
-[^2]: This is a known problem caused by upstream PTY master file descriptor (`/dev/ptmx`) leaks on macOS.
-Some possibly related issues and PRs:
+[^2]: This is a known problem caused by upstream PTY master file descriptor (`/dev/ptmx`) leaks on macOS. Some possibly related issues and PRs:
     - **Upstream Node-PTY Issues & Fixes**:
       - [microsoft/node-pty#882](https://github.com/microsoft/node-pty/pull/882) — *Upstream macOS fix PR: "fix: /dev/ptmx leak on macOS"*
       - [microsoft/node-pty#931](https://github.com/microsoft/node-pty/pull/931) — *Fix: close kqueue fd in SetupExitCallback on macOS*
