@@ -4,7 +4,7 @@ Agentic AIs[^1] have a tendency to leak ptys[^2] on macOS every time they run a 
 
 This tool identifies and closes those leaks where possible[^6]. Running the script raw will just identify leaks, running with `--close` will close them.
 
-Code written mostly by Claude. I can't guarantee there aren't mistakes but in my own testing it seems fine and safe.
+Code written mostly by Claude. I can't guarantee there aren't mistakes but in my own testing it seems fine and safe. (Update: there was a bug that killed my terminals but only because I was running a dev build of iTerm2, and also Claude says it found and fixed it the bug, and also explicitly excluded terminals. Should be fine now, probably)
 
 [^1]: **Gemini CLI** and **Claude Code** (and potentially other node-based CLIs or agents, though they haven't been tested).
 
