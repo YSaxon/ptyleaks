@@ -8,7 +8,8 @@ Code written mostly by Claude. I can't guarantee there aren't mistakes but in my
 
 [^1]: **Gemini CLI** and **Claude Code** (and potentially other node-based CLIs or agents, though they haven't been tested).
 
-[^2]: This is a known problem caused by upstream PTY master file descriptor (`/dev/ptmx`) leaks on macOS. For details and discussion on why they persist, see:
+[^2]: This is a known problem caused by upstream PTY master file descriptor (`/dev/ptmx`) leaks on macOS.
+Some possibly related issues and PRs:
     - **Upstream Node-PTY Issues & Fixes**:
       - [microsoft/node-pty#710](https://github.com/microsoft/node-pty/issues/710) — *macOS `/dev/ptmx` leak issue*
       - [microsoft/node-pty#657](https://github.com/microsoft/node-pty/issues/657) — *PTY leak leading to openpty failure*
@@ -16,6 +17,8 @@ Code written mostly by Claude. I can't guarantee there aren't mistakes but in my
       - [microsoft/node-pty#931](https://github.com/microsoft/node-pty/pull/931) — *Fix: close kqueue fd in SetupExitCallback on macOS*
     - **Gemini CLI Issues & Fixes**:
       - [google/gemini-cli#20804](https://github.com/google/gemini-cli/issues/20804) — *PTY file descriptor leak issue*
+      - [google/gemini-cli#26327](https://github.com/google/gemini-cli/issues/26327) — *macOS: Gemini CLI processes retain hundreds of /dev/ptmx handles, exhausting PTYs*
+      - [google/gemini-cli#27155](https://github.com/google/gemini-cli/issues/27155) — *PTY memory and file descriptor leak in ShellExecutionService*
       - [google/gemini-cli#27147](https://github.com/google/gemini-cli/pull/27147) — *PR: Upgrade pty dependencies to pull upstream fix*
       - [google/gemini-cli#27154](https://github.com/google/gemini-cli/pull/27154) — *PR: Prevent PTY memory leak by synchronously deleting active entries*
 
