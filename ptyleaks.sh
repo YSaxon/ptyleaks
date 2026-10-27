@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Classify /dev/ptmx master fds as live or leaked, optionally close the leaked ones.
 # See THEORY.md for the decode/liveness/race theory behind this.
-# Usage: ptyleaks.sh [--close] [--quiet|-q] [--confirm-delay N] [pid ...]
+# Usage: ptyleaks.sh [--close] [--quiet|-q] [--confirm-delay N] [--include-terminals] [pid ...]
 #   (default targets: every process holding /dev/ptmx; default --confirm-delay: 2)
 set -euo pipefail
 
 CLOSE=0
 QUIET=0
+INCLUDE_TERMINALS=0
 CONFIRM_DELAY=2   # seconds between the two leak-confirmation scans, see close_leaked()
 
 usage() {
@@ -35,16 +36,21 @@ Options:
                          which is long enough for any in-flight setup to
                          either attach (now live, excluded) or have long
                          since finished (still leaked, confirmed).
+  --include-terminals   also close leaked fds in real terminal emulators
+                         (Terminal, iTerm2/iTermServer, VS Code, kitty, ...).
+                         Off by default: their ptys are your actual sessions,
+                         and a misclassification there kills them outright.
+                         They're still classified and printed either way.
   --quiet, -q            one character per fd instead of a full row
                          (. live, X leaked). Per-pid and summary lines still
                          print.
   --help, -h             show this help and exit
 
 Notes:
-  - Processes running from a .app bundle (Electron/Chromium helpers, most
-    Mac apps) are flagged: their hardened runtime blocks lldb attach
-    regardless of sudo, so --close will report FAILED for them, not silently
-    do nothing.
+  - Processes whose binary is hardened-runtime signed or SIP-protected
+    (Electron/Chromium helpers, most shipped Mac apps, Apple binaries) are
+    flagged: lldb can't attach regardless of sudo, so --close will report
+    FAILED for them, not silently do nothing.
   - See THEORY.md in this directory for the decode/liveness/race theory
     behind how this classifies fds.
 EOF
@@ -71,6 +77,14 @@ build_live_set() {
   while IFS= read -r line; do
     LIVE_SET["${line#/dev/}"]=1
   done < <(lsof -n -Fn 2>/dev/null | awk '/^n\/dev\/ttys/{print substr($0,2)}' | sort -u)
+  # Without sudo, lsof silently omits other users' processes — e.g. the
+  # root-owned /usr/bin/login every iTerm/Terminal session starts under, or a
+  # shell after `sudo -s`. A pty held only by such a process would read as
+  # leaked. ps sees every process's controlling tty regardless of owner, so
+  # union that in. (Controlling tty only — lsof still covers the rest.)
+  while IFS= read -r line; do
+    LIVE_SET["$line"]=1
+  done < <(ps -ax -o tty= 2>/dev/null | awk '$1 ~ /^ttys/{print $1}' | sort -u)
 }
 is_live() {
   [ -n "${LIVE_SET[$1]+x}" ]
@@ -94,19 +108,40 @@ detect_name() {
   fi
 }
 
-# Heuristic, not a guarantee: any process running from inside a .app bundle
-# (Electron/Chromium helpers, standard Mac apps) is almost always built with
-# the hardened runtime, which blocks same-user lldb attach outright — no
-# amount of sudo fixes that. Confirmed directly against a VS Code helper
-# ("Not allowed to attach to process"). Plain CLI binaries (gemini, node,
-# claude.exe under homebrew/node_modules) are not affected.
+# lldb can't attach (regardless of sudo) when the binary has the hardened
+# runtime flag — confirmed against a VS Code helper ("Not allowed to attach
+# to process") — or is an Apple platform binary under SIP (/System, /usr/bin,
+# ...). Checked from the actual code signature, not guessed from the path:
+# an earlier ".app bundle = unattachable" guess wrongly warned that a
+# self-built, adhoc-signed iTerm2 couldn't be closed, when it could.
 looks_unattachable() {
-  local pid="$1" full
-  full=$(ps -p "$pid" -o command= 2>/dev/null || true)
-  case "$full" in
-    *.app/Contents/MacOS/*) return 0 ;;
-    *) return 1 ;;
+  local exe; exe=$(ps -p "$1" -o comm= 2>/dev/null || true)
+  case "$exe" in
+    /System/*|/usr/bin/*|/usr/sbin/*|/usr/libexec/*|/bin/*|/sbin/*) return 0 ;;
   esac
+  # capture first: piping straight into grep -q under pipefail can SIGPIPE
+  # codesign and turn a match into a failure
+  local sig; sig=$(codesign -dv "$exe" 2>&1 || true)
+  grep -qE '^CodeDirectory.*flags=0x[0-9a-f]+\([^)]*runtime' <<<"$sig"
+}
+
+# Real terminal emulators (and multiplexers / remote-login daemons) hold
+# masters for the user's actual sessions. This tool exists to clean up after
+# leaky CLI agents, not terminals, and getting a terminal wrong is
+# catastrophic: closing its masters kills every session in it — including,
+# possibly, the one this script runs in (which then dies mid-close). Matched
+# against the executable path, so dev builds outside /Applications count too.
+looks_like_terminal() {
+  local exe; exe=$(ps -p "$1" -o comm= 2>/dev/null || true)
+  case "$exe" in
+    */Terminal.app/*|*/iTerm*.app/*|*/iTerm2/iTermServer*|*/iTermServer*) return 0 ;;
+    */Visual\ Studio\ Code*.app/*|*/Cursor.app/*|*/Windsurf.app/*) return 0 ;;
+    */kitty.app/*|*/Alacritty.app/*|*/WezTerm.app/*|*/Ghostty.app/*|*/Warp.app/*|*/Hyper.app/*|*/Tabby.app/*) return 0 ;;
+  esac
+  case "${exe##*/}" in
+    tmux|tmux:*|screen|zellij|sshd|sshd-session|mosh-server|kitty|alacritty|wezterm-gui|ghostty) return 0 ;;
+  esac
+  return 1
 }
 
 pids_with_ptmx() {
@@ -121,15 +156,28 @@ pids_with_ptmx() {
 # badly enough that the target didn't survive the experiment. lldb's attach
 # already halts the process for the whole scripted session on its own (that's
 # why the `expr` calls run synchronously) — no extra pause is needed or safe.
+#
+# Args after pid are "fd:ttysNNN" pairs. fd numbers get reused: between the
+# confirm scan and the attach, the process could close a leaked fd and open a
+# live pty that lands on the same number. So each close is guarded inside the
+# stopped target — only close if ptsname(fd) still names the tty we
+# classified; otherwise the expr returns -2 and the fd is left alone.
 close_fds() {
   local pid="$1"; shift
-  local fds=("$@")
+  local fds=() ttys=() pair
+  for pair in "$@"; do fds+=("${pair%%:*}"); ttys+=("${pair#*:}"); done
   [ ${#fds[@]} -eq 0 ] && return 0
 
   local cmd_file; cmd_file=$(mktemp)
-  local fd
-  for fd in "${fds[@]}"; do
-    echo "expr (int)close($fd)" >> "$cmd_file"
+  local i fd
+  # keep going past a failed expr, or every later fd silently goes unclosed
+  echo "settings set interpreter.stop-command-source-on-error false" >> "$cmd_file"
+  for i in "${!fds[@]}"; do
+    fd="${fds[$i]}"
+    # the @@fd marker ties each result to its fd — a failed expr prints no
+    # "(int) $K = ..." line, so positional matching would shift every later one
+    echo "script print(\"@@fd $fd\")" >> "$cmd_file"
+    echo "expr -- const char *p = (const char *)ptsname($fd); (int)(p && !(int)strcmp(p, \"/dev/${ttys[$i]}\") ? (int)close($fd) : -2)" >> "$cmd_file"
   done
   echo "process detach" >> "$cmd_file"
   echo "quit" >> "$cmd_file"
@@ -146,7 +194,7 @@ close_fds() {
   lldb_out=$(lldb -p "$pid" --batch -s "$cmd_file" 2>&1) || attach_rc=$?
   rm -f "$cmd_file"
 
-  if [ "$attach_rc" -ne 0 ] || printf '%s' "$lldb_out" | grep -q "attach failed"; then
+  if [ "$attach_rc" -ne 0 ] || grep -q "attach failed" <<<"$lldb_out"; then
     echo "  close FAILED for all ${#fds[@]} fd(s): lldb could not attach." >&2
     echo "  likely cause: hardened-runtime / sandboxed process (common for" >&2
     echo "  Electron/Chromium .app helpers) — same-user attach is blocked" >&2
@@ -155,30 +203,38 @@ close_fds() {
     return 0
   fi
 
-  # each "expr (int)close(N)" line produces "(int) $K = <result>" in order;
-  # 0 = success, -1 = EBADF (already closed / never was a valid fd)
-  local -a results=()
-  while IFS= read -r r; do results+=("$r"); done < <(
-    printf '%s' "$lldb_out" | grep -oE '\(int\) \$[0-9]+ = -?[0-9]+' | grep -oE -- '-?[0-9]+$'
-  )
+  # result per fd, keyed via the @@fd markers: 0 = closed, -1 = close()
+  # failed, -2 = fd no longer points at the classified tty (skipped), unset =
+  # expr itself errored
+  local -A results=()
+  local cur="" line
+  while IFS= read -r line; do
+    case "$line" in
+      @@fd\ *) cur="${line#@@fd }" ;;
+      "(int) \$"*) [ -n "$cur" ] && results["$cur"]="${line##* = }"; cur="" ;;
+    esac
+  done <<<"$lldb_out"
 
   # lldb reporting close()==0 isn't proof the fd is actually gone — verify
   # against the live fd table instead of trusting the return value alone.
   local still_open; still_open=$(lsof -n -p "$pid" -Fd 2>/dev/null | sed -n 's/^f//p')
 
-  local i ok=0 fail=0
-  for i in "${!fds[@]}"; do
-    local fd="${fds[$i]}" verified="not verified"
+  local ok=0 fail=0
+  for fd in "${fds[@]}"; do
+    local verified r="${results[$fd]:-?}"
     if grep -qx "$fd" <<<"$still_open"; then
       verified="STILL OPEN"
     else
       verified="confirmed closed"
     fi
-    if [ "${results[$i]:-1}" = "0" ] && [ "$verified" = "confirmed closed" ]; then
+    if [ "$r" = "0" ] && [ "$verified" = "confirmed closed" ]; then
       [ "$QUIET" -eq 0 ] && echo "    fd $fd: closed ($verified)"
       ok=$((ok+1))
+    elif [ "$r" = "-2" ]; then
+      echo "    fd $fd: skipped (no longer points at the classified tty — fd reused?)" >&2
+      fail=$((fail+1))
     else
-      echo "    fd $fd: FAILED (close() returned ${results[$i]:-?}, $verified)" >&2
+      echo "    fd $fd: FAILED (close() returned $r, $verified)" >&2
       fail=$((fail+1))
     fi
   done
@@ -221,8 +277,14 @@ classify_pid() {
   local cmd; cmd=$(detect_name "$pid")
   echo "pid $pid ($cmd) — $count /dev/ptmx fds"
   G_FDS=$((G_FDS + count))
+  local is_terminal=0
+  if looks_like_terminal "$pid"; then
+    is_terminal=1
+    [ "$INCLUDE_TERMINALS" -eq 0 ] && [ "$CLOSE" -eq 1 ] && \
+      echo "  note: terminal emulator — never closed without --include-terminals"
+  fi
   if looks_unattachable "$pid"; then
-    echo "  note: runs from a .app bundle — hardened runtime likely blocks lldb attach, --close will probably FAIL here"
+    echo "  note: hardened runtime / SIP-protected binary — lldb can't attach, --close will FAIL here"
     G_UNATTACHABLE=$((G_UNATTACHABLE + 1))
   fi
 
@@ -247,7 +309,7 @@ classify_pid() {
   echo "  $live_n live, $leaked_n leaked"
   G_LIVE=$((G_LIVE + live_n)); G_LEAKED=$((G_LEAKED + leaked_n))
 
-  if [ ${#candidates[@]} -gt 0 ]; then
+  if [ ${#candidates[@]} -gt 0 ] && { [ "$is_terminal" -eq 0 ] || [ "$INCLUDE_TERMINALS" -eq 1 ]; }; then
     CANDIDATES["$pid"]="${candidates[*]}"
     CANDIDATE_PIDS+=("$pid")
   fi
@@ -287,7 +349,7 @@ confirm_and_close() {
       if is_live "$ttyname"; then
         excluded+=("$fd")
       else
-        still_leaked+=("$fd")
+        still_leaked+=("$fd:$ttyname")
       fi
     done
 
@@ -310,7 +372,12 @@ main() {
       --help|-h) usage; exit 0 ;;
       --close) CLOSE=1 ;;
       --quiet|-q) QUIET=1 ;;
-      --confirm-delay) shift; CONFIRM_DELAY="$1" ;;
+      --include-terminals) INCLUDE_TERMINALS=1 ;;
+      --confirm-delay)
+        case "${2:-}" in
+          ''|*[!0-9.]*) echo "--confirm-delay needs a number of seconds" >&2; exit 1 ;;
+        esac
+        shift; CONFIRM_DELAY="$1" ;;
       # only digits count as a pid — anything else that isn't a known flag
       # is a typo'd option, and silently treating it as a pid used to just
       # neuter the whole run (e.g. -q alone, before this got an alias,
@@ -353,7 +420,7 @@ main() {
     [ "$G_EXCLUDED" -gt 0 ] && echo "  excluded (became live during confirm delay): $G_EXCLUDED"
     echo "  closed (verified):  $G_CLOSED"
     echo "  close failed:       $G_CLOSE_FAILED"
-    echo "  pids likely unattachable (.app bundles): $G_UNATTACHABLE"
+    echo "  pids unattachable (hardened runtime / SIP): $G_UNATTACHABLE"
     echo "  ptmx fds remaining: $((G_FDS - G_CLOSED))  (computed, not rescanned)"
   fi
 }

@@ -12,8 +12,8 @@ trips and *any* new pty alloc — including `sudo` itself — fails.
 
 `/dev/ptmx` is a devfs clone device. Each `open()` allocates a free pty
 index; that index is the minor number of the resulting master vnode, and
-the paired slave is `/dev/ttysNNN` with NNN = that same index in **decimal**
-(confirmed empirically — `pty.openpty()` handing out ttys519/520/521 in a
+the paired slave is `/dev/ttysNNN` with NNN = that same index in **decimal**,
+**zero-padded to 3 digits** (`ttys004`, not `ttys4`) (confirmed empirically — `pty.openpty()` handing out ttys519/520/521 in a
 row, matching the raw device minor exactly. An earlier hex-digit theory
 was wrong and got caught by the validation probe below).
 
@@ -36,8 +36,17 @@ lsof -p $PID -Fd -Fr -Fn
 
 `-Fd` = fd number, `-Fr` = raw device (hex), `-Fn` = name. Filter to rows
 where name is `/dev/ptmx`, take the low bits of the raw device field, and
-format as a plain decimal number appended to `ttys` — that's the slave tty
-name for that fd.
+format as a 3-digit zero-padded decimal appended to `ttys`
+(`printf 'ttys%03d'`) — that's the slave tty name for that fd.
+
+The padding matters more than anything else here. An earlier version
+appended the bare decimal, so every pty below 100 decoded as e.g. `ttys76`,
+never matched lsof's `/dev/ttys076`, and read as leaked. `--close` then
+closed live masters in iTerm2 and iTermServer, killing ~60 real terminal
+sessions (and the script itself, mid-close, when it severed its own tty).
+Earlier testing never caught it because test ptys happened to land on
+3-digit numbers (ttys519/520/521 above). The two-scan confirm can't catch
+this kind of bug either — both scans make the same decode mistake.
 
 ## Live vs leaked
 
@@ -58,6 +67,13 @@ lsof -t /dev/ttysNNN
 
 Empty output → no process (self or child) has the slave fd → the master is
 leaked. Any output → live, regardless of controlling-terminal status.
+
+One catch: without sudo, lsof silently omits other users' processes. Every
+Terminal/iTerm session starts under a root-owned `/usr/bin/login`, and a
+shell after `sudo -s` is root too, so a pty held *only* by root processes
+reads as leaked. `ps -ax -o tty=` does see every process's controlling tty,
+regardless of owner — so it's the wrong *sole* test (above) but the right
+supplement: the script counts a tty as live if either lsof or ps sees it.
 
 ## Known false positives (can't be fully resolved externally)
 
